@@ -77,20 +77,42 @@
 -define(DEFAULT_MAX_HISTORY, 20).
 -define(DEFAULT_SCHEDULER_INTERVAL, 60000).
 
+-define(DEFAULT_PRIORITY_COEFF, "0.75").
+-define(DEFAULT_SHARES, 100).
+-define(SHARES, couch_replicator_scheduler_shares).
+-define(USAGE, couch_replicator_scheduler_usage).
 
--record(state, {interval, timer, max_jobs, max_churn, max_history, stats_pid}).
+
+-record(state, {
+    interval,
+    timer,
+    max_jobs,
+    max_churn,
+    max_history,
+    priority_coeff,
+    stats_pid
+}).
+
 -record(job, {
     id :: job_id() | '$1' | '_',
     rep :: #rep{} | '_',
     pid :: undefined | pid() | '$1' | '_',
     monitor :: undefined | reference() | '_',
-    history :: history() | '_'
+    history :: history() | '_',
+    usage_key :: undefined | binary() | '_',
+    priority :: float()
 }).
 
 -record(stats_acc, {
     pending_n = 0 :: non_neg_integer(),
     running_n = 0 :: non_neg_integer(),
     crashed_n = 0 :: non_neg_integer()
+}).
+
+-record(usage, {
+   key :: binary(),
+   usage = 0 :: non_neg_integer(),
+   num_jobs = 0 :: non_neg_integer(),
 }).
 
 
@@ -108,7 +130,9 @@ add_job(#rep{} = Rep) when Rep#rep.id /= undefined ->
             Job = #job{
                 id = Rep#rep.id,
                 rep = Rep,
-                history = [{added, os:timestamp()}]
+                history = [{added, os:timestamp()}],
+                usage_key = get_usage_key(Rep),
+                priority = new_job_priority(Rep)
             },
             gen_server:call(?MODULE, {add_job, Job}, infinity);
         true ->
@@ -140,7 +164,13 @@ rep_state(RepId) ->
 -spec job_summary(job_id(), non_neg_integer()) -> [_] | nil.
 job_summary(JobId, HealthThreshold) ->
     case job_by_id(JobId) of
-        {ok, #job{pid = Pid, history = History, rep = Rep}} ->
+        {ok, #job{} = Job} ->
+            #job{
+                pid = Pid,
+                history = History,
+                rep = Rep,
+                priority = Priority
+            } = Job,
             ErrorCount = consecutive_crashes(History, HealthThreshold),
             {State, Info} = case {Pid, ErrorCount} of
                 {undefined, 0}  ->
@@ -163,6 +193,7 @@ job_summary(JobId, HealthThreshold) ->
                 {info, couch_replicator_utils:ejson_state_info(Info)},
                 {error_count, ErrorCount},
                 {last_updated, last_updated(History)},
+                {scheduler_priority, Priority},
                 {start_time,
                     couch_replicator_utils:iso8601(Rep#rep.start_time)},
                 {source_proxy, job_proxy_url(Rep#rep.source)},
@@ -226,9 +257,12 @@ update_job_stats(JobId, Stats) ->
 
 init(_) ->
     config:enable_feature('scheduler'),
-    EtsOpts = [named_table, {keypos, #job.id}, {read_concurrency, true},
+    EtsOpts = [named_table, {read_concurrency, true},
         {write_concurrency, true}],
-    ?MODULE = ets:new(?MODULE, EtsOpts),
+    ?MODULE = ets:new(?MODULE, EtsOpts ++ [{keypos, #job.id}]),
+    ?SHARES = ets:new(?MODULE, EtsOpts),
+    ?STOPPED_USAGE = ets:new(?STOPPED_USAGE, EtsOpts),
+    ?USAGE = ?USAGE = ets:new(?USAGE, EtsOpts),
     ok = config:listen_for_changes(?MODULE, nil),
     Interval = config:get_integer("replicator", "interval",
         ?DEFAULT_SCHEDULER_INTERVAL),
@@ -237,12 +271,16 @@ init(_) ->
         ?DEFAULT_MAX_CHURN),
     MaxHistory = config:get_integer("replicator", "max_history",
         ?DEFAULT_MAX_HISTORY),
+    PriorityCoeff = list_to_float(config:get("replicator", "priority_coeff",
+        ?DEFAULT_PRIORITY_COEFF)),
     Timer = erlang:send_after(Interval, self(), reschedule),
+    ok = init_shares(),
     State = #state{
         interval = Interval,
         max_jobs = MaxJobs,
         max_churn = MaxChurn,
         max_history = MaxHistory,
+        priority_coeff = PriorityCoeff,
         timer = Timer,
         stats_pid = start_stats_updater()
     },
@@ -290,6 +328,18 @@ handle_cast({set_interval, Interval}, State) when is_integer(Interval),
     couch_log:notice("~p: interval set to ~B", [?MODULE, Interval]),
     {noreply, State#state{interval = Interval}};
 
+handle_cast({set_priority_coeff, Coeff}, State) when is_float(Coeff),
+        Coeff > 0 ->
+    couch_log:notice("~p: priority_coeff set to ~B", [?MODULE, Coeff]),
+    {noreply, State#state{priority_coeff = Coeff}};
+
+handle_cast({update_shares, Key, Shares}, State) when is_binary(Db),
+        is_integer(Shares), Shares >= 0 ->
+    couch_log:notice("~ shares for ~S set to ~B", [?MODULE, Key, Shares]),
+    ok = update_shares(Key, Shares),
+    {noreply, State};
+
+
 handle_cast({update_job_stats, JobId, Stats}, State) ->
     case rep_state(JobId) of
         nil ->
@@ -314,6 +364,7 @@ handle_info(reschedule, State) ->
 handle_info({'DOWN', _Ref, process, Pid, normal}, State) ->
     {ok, Job} = job_by_pid(Pid),
     couch_log:notice("~p: Job ~p completed normally", [?MODULE, Job#job.id]),
+    ok = add_stopped_job_usage(Job, os:timestamp()),
     remove_job_int(Job),
     update_running_jobs_stats(State#state.stats_pid),
     {noreply, State};
@@ -324,6 +375,7 @@ handle_info({'DOWN', _Ref, process, Pid, Reason0}, State) ->
         {shutdown, ShutdownReason} -> ShutdownReason;
         Other -> Other
     end,
+    ok = add_stopped_job_usage(Job, os:timestamp()),
     ok = handle_crashed_job(Job, Reason, State),
     {noreply, State};
 
@@ -367,6 +419,15 @@ handle_config_change("replicator", "interval", V, _, S) ->
 
 handle_config_change("replicator", "max_history", V, _, S) ->
     ok = gen_server:cast(?MODULE, {set_max_history, list_to_integer(V)}),
+    {ok, S};
+
+handle_config_change("replicator", "priority_coeff", V, _, S) ->
+    ok = gen_server:cast(?MODULE, {set_priority_coeff, list_to_float(V)}),
+    {ok, S};
+
+handle_config_change("replicator.shares", Key, V, _, S) ->
+    ok = gen_server:cast(?MODULE, {update_shares, list_to_binary(Key),
+        list_to_integer(V)}),
     {ok, S};
 
 handle_config_change(_, _, _, _, S) ->
@@ -600,6 +661,7 @@ add_job_int(#job{} = Job) ->
 maybe_remove_job_int(JobId, State) ->
     case job_by_id(JobId) of
         {ok, Job} ->
+            ok = add_stopped_job_usage(Job, os:timestamp()),
             ok = stop_job_int(Job, State),
             true = remove_job_int(Job),
             couch_stats:increment_counter([couch_replicator, jobs, removes]),
@@ -838,6 +900,7 @@ job_ejson(Job) ->
         {doc_id, Rep#rep.doc_id},
         {info, couch_replicator_utils:ejson_state_info(Rep#rep.stats)},
         {history, History},
+        {scheduler_priority, Job#job.priority},
         {node, node()},
         {start_time, couch_replicator_utils:iso8601(Rep#rep.start_time)}
     ]}.
@@ -968,6 +1031,105 @@ existing_replication(#rep{} = NewRep) ->
         {error, not_found} ->
             false
     end.
+
+
+init_shares() ->
+    lists:foreach(fun({K, V}) ->
+        ok = update_shares(list_to_binary(K), list_to_integer(V))
+    end, config:get("replicator.shares").
+
+
+update_shares(Key, Shares) when is_binary(Db), is_integer(Shares) ->
+    true = ets:insert(?SHARES, {Key, Shares}),
+    ok.
+
+
+get_usage_key(#rep{} = Rep) ->
+    case is_binary(Rep#rep.db_name) of
+        true -> Rep#rep.db_name;
+        false -> (Rep#rep.user_ctx)#user_ctx.name
+    end.
+
+
+% Job usage is defined as number of milliseconds it was running since the last
+% time it started.
+get_job_usage(#job{} = Now, {_, _, _} = Now) ->
+    timer:now_diff(Now, last_started(Job)) div 1000.
+
+
+new_job_priority(#rep{} = Rep) ->
+    0.0. % get average priority here so new jobs don't monopolize the scheduler
+
+
+get_usage(Db) when is_binary(Db) ->
+    0.
+
+
+get_shares(Db) when is_binary(Db) ->
+    0.
+
+
+get_db_num_jobs(Db) when is_binary(Db) ->
+    0.
+
+
+% Accumulate usage from jobs which stop in the middle of the sheduling cycle.
+% The accumulated value is then summed up with all the running job usage at the
+% start of each scheduling cycle.
+%
+add_stopped_job_usage(#job{pid = undefined}, {_, _, _} = _Now) ->
+    % Only accumulate usage from jobs which were running. If a stopped jobs is
+    % removed we ignore it here.
+    ok;
+
+add_stopped_job_usage(#job{} = Job, {_, _, _} = Now) ->
+    Key = Job#job.usage_key,
+    Usage = get_job_usage(Job, Now),
+    ets:update_counter(?STOPPED_USAGE, Key, Usage, {Key, 0}),
+    ok.
+
+update_usage({_, _, } = Now) ->
+    StoppedUsage = ets:foldl(fun({Key, Val}, Acc) ->
+        Acc#{Key := Val}
+    end, #{}, ?STOPPED_USAGE),
+
+    % Next cycle start with a clean stopped usage table
+    true = ets:delete_all_objects(?STOPPED_USAGE),
+
+    % Get usage from all the running jobs and per-db job counts. Running job
+    % usage is added to the already computed stopped job usage.
+    {Usage, NumJobs} = ets:foldl(fun(Job, {UsgAcc, CntAcc}) ->
+        Key = Job#job.usage_key,
+        CntFun = fun(Val) -> Val + 1 end,
+        CntAcc1 = maps:update_with(Key, CntFun, 0, CntAcc),
+        UsgAcc1 = case is_pid(Job#job.pid) of
+            true ->
+                UsageInc = get_job_usage(Job, Now),
+                UsgFun = fun(Val) -> Val + UsageInc end,
+                maps:update_with(Key, UsgFun, 0, UsgAcc);
+            false ->
+                UsgAcc
+        end,
+        {CntAcc1, UsgAcc1}
+    end, {StoppedUsage, #{}}, ?MODULE),
+
+    % Clear the table first. This will usage stats from accounts which are not
+    % longer running or haven't just stopped running their jobs in the last
+    % scheduling cycle.
+    true = ets:delete_all_objects(?USAGE),
+
+    maps:fold(fun(Key, Usage, ok) ->
+        JobCount = maps:get(Key, NumJobs, 0)
+        true = ets:insert(?USAGE, {Key, Usage, maps:get(Key, NumJobs, 0)})
+    end, ok, Usage).
+
+
+decay_priorities(PriorityCoeff) ->
+    ok.
+
+
+adjust_priorities() ->
+    ok.
 
 
 -ifdef(TEST).
